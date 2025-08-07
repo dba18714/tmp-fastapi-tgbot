@@ -1,31 +1,26 @@
-import os
 import logging
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
-from dotenv import load_dotenv
 import uvicorn
-
-# 加载环境变量
-load_dotenv()
+from config import config
 
 # 配置日志
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.DEBUG if config.DEBUG else logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# 从环境变量获取配置
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+# 验证配置
+config_errors = config.validate()
+if config_errors:
+    for error in config_errors:
+        logger.warning(f"配置警告: {error}")
 
-if not BOT_TOKEN or BOT_TOKEN == "your_bot_token_here":
-    print("⚠️  警告: 请在.env文件中设置真实的TELEGRAM_BOT_TOKEN")
-    if not BOT_TOKEN:
-        BOT_TOKEN = "dummy_token_for_testing"
+    if not config.has_valid_bot_token:
+        logger.warning("使用测试token继续运行，但功能将受限")
 
 # 创建FastAPI应用
 app = FastAPI(title="Telegram Echo Bot", version="1.0.0")
@@ -75,7 +70,8 @@ async def echo_message(update: Update, context) -> None:
 def create_telegram_app() -> Application:
     """创建并配置Telegram应用"""
     # 创建应用
-    application = Application.builder().token(BOT_TOKEN).build()
+    token = config.TELEGRAM_BOT_TOKEN if config.has_valid_bot_token else "dummy_token"
+    application = Application.builder().token(token).build()
     
     # 添加命令处理器
     application.add_handler(CommandHandler("start", start_command))
@@ -91,23 +87,39 @@ def create_telegram_app() -> Application:
 async def startup_event():
     """应用启动时的初始化"""
     global telegram_app
-    
+
+    logger.info(f"🚀 启动 Telegram Echo Bot (环境: {config.ENVIRONMENT})")
+
+    # 检查配置
+    if not config.has_valid_bot_token:
+        logger.warning("⚠️  Bot Token 无效，某些功能将不可用")
+
     # 创建Telegram应用
     telegram_app = create_telegram_app()
-    
+
     # 初始化应用
     await telegram_app.initialize()
-    
-    # 设置webhook
-    if WEBHOOK_URL:
-        webhook_url = f"{WEBHOOK_URL}/webhook"
-        await telegram_app.bot.set_webhook(
-            url=webhook_url,
-            secret_token=WEBHOOK_SECRET
-        )
-        logger.info(f"Webhook设置成功: {webhook_url}")
+
+    # 设置webhook（仅在有效配置时）
+    if config.should_set_webhook:
+        try:
+            webhook_url = f"{config.WEBHOOK_URL}/webhook"
+            await telegram_app.bot.set_webhook(
+                url=webhook_url,
+                secret_token=config.WEBHOOK_SECRET
+            )
+            logger.info(f"✅ Webhook设置成功: {webhook_url}")
+        except Exception as e:
+            logger.error(f"❌ Webhook设置失败: {e}")
+            if config.is_production:
+                logger.error("生产环境webhook设置失败，应用可能无法正常工作")
+            else:
+                logger.info("开发环境webhook设置失败，这通常是正常的")
     else:
-        logger.warning("未设置WEBHOOK_URL，请确保在生产环境中配置")
+        if config.is_development:
+            logger.info("🔧 开发环境：跳过webhook设置")
+        else:
+            logger.warning("⚠️  生产环境但未设置webhook，请检查配置")
 
 
 @app.on_event("shutdown")
@@ -141,9 +153,9 @@ async def webhook(request: Request):
         body = await request.body()
         
         # 验证secret token（如果设置了）
-        if WEBHOOK_SECRET:
+        if config.WEBHOOK_SECRET:
             secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-            if secret_header != WEBHOOK_SECRET:
+            if secret_header != config.WEBHOOK_SECRET:
                 logger.warning("Webhook secret token验证失败")
                 raise HTTPException(status_code=403, detail="Forbidden")
         
@@ -166,7 +178,9 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "telegram-echo-bot",
-        "webhook_configured": bool(WEBHOOK_URL)
+        "environment": config.ENVIRONMENT,
+        "webhook_configured": config.has_valid_webhook_url,
+        "bot_token_configured": config.has_valid_bot_token
     }
 
 
@@ -174,8 +188,8 @@ if __name__ == "__main__":
     # 开发环境运行
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info"
+        host=config.HOST,
+        port=config.PORT,
+        reload=config.is_development,
+        log_level="debug" if config.DEBUG else "info"
     )
